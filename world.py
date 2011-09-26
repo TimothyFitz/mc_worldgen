@@ -4,6 +4,7 @@ import os.path
 import collections
 import zlib
 import itertools
+import random
 
 from cStringIO import StringIO
 
@@ -39,15 +40,7 @@ class Region(object):
     
     def write_chunk(self, chunk):
         self.write_chunk_data(chunk.cx, chunk.cz, chunk.serialize())
-
-class RegionDict(collections.defaultdict):
-    def __init__(self, basepath):
-        collections.defaultdict.__init__(self)
-        self.basepath = basepath
         
-    def __missing__(self, (rx, rz)):
-        return Region(self.basepath, rx, rz)
-
 class TagType(object):
     def __init__(self, id):
         self.id = id
@@ -142,11 +135,7 @@ class TagInStream(object):
         else:
             name = ""
         
-        print "Start", tag.id, name, self.p
-        
         payload = self.read_tag(tag)
-        
-        print "End", name
         
         return Tag(type=tag, name=name, payload=payload)
 
@@ -189,20 +178,51 @@ class TagOutStream(object):
 
 class Chunk(object):
     def __init__(self, cx, cz, raw_data):
+        print "INIT CHUNK", cx, cz, len(raw_data)
         self.cx, self.cz = cx, cz
         if raw_data:
             length, = struct.unpack(">L", raw_data[:4])
             data = zlib.decompress(raw_data[5:5+length])
             self.root_tag = TagInStream(data).read_named_tag()
-            self.blocks = ChunkBlocks(self.root_tag.children['Level'].children['Blocks'].payload)
-            self.block_data = ChunkBlockData(self.root_tag.children['Level'].children['Data'].payload)
+            level_children = self.root_tag.children['Level'].children
+            self.blocks = ChunkBlocks(level_children['Blocks'].payload)
+            self.block_data = ChunkNibbleData(level_children['Data'].payload)
+            self.skylight = ChunkNibbleData(level_children['SkyLight'].payload)
+            self.blocklight = ChunkNibbleData(level_children['BlockLight'].payload)
+            self.heightmap = ChunkHeightMap(level_children['HeightMap'].payload)
+            
+    def relight(self):
+        for x,z in itertools.product(range(16), range(16)):
+            casting_ray = True
+            heightmap = 127
+            for y in reversed(range(128)):
+                if casting_ray and self.blocks[x,y,z] == 0:
+                    sky = 15
+                    heightmap = y
+                else:
+                    sky = 0
+
+                self.skylight[x,y,z] = sky
+                self.blocklight[x,y,z] = 0
+
+            self.heightmap[x,z] = heightmap        
         
     def serialize(self):
         out = TagOutStream()
         out.write_named_tag(self.root_tag)
-        data = zlib.compress(out.getvalue())
+        data = zlib.compress(out.getvalue(), 9)
         return struct.pack(">LB", len(data), 2) + data
 
+class ChunkHeightMap(object):
+    def __init__(self, heightmap_array):
+        self.heightmap_array = heightmap_array
+
+    def __getitem__(self, (x,z)):     
+        return self.heightmap_array[x+z*16]
+
+    def __setitem__(self, (x,z), value):
+        self.heightmap_array[x+z*16] = value
+        
 class ChunkBlocks(object):
     def __init__(self, block_array):
         self.block_array = block_array
@@ -219,7 +239,7 @@ def split_nibble(nibble):
 def join_nibble((low, high)):
     return (low & 0x0F) + ((high << 4) & 0xF0)
         
-class ChunkBlockData(object):
+class ChunkNibbleData(object):
     def __init__(self, data_array):
         self.data_array = data_array
 
@@ -233,34 +253,172 @@ class ChunkBlockData(object):
         data[offset % 2] = value
         self.data_array[offset >> 1] = join_nibble(data)     
 
+class RegionDict(collections.defaultdict):
+    def __init__(self, basepath):
+        collections.defaultdict.__init__(self)
+        self.basepath = basepath
+
+    def __missing__(self, (rx, rz)):
+        self[rx, rz] = region = Region(self.basepath, rx, rz)
+        return region
+
+class ChunkDict(collections.defaultdict):
+    def __init__(self, regions):
+        collections.defaultdict.__init__(self)
+        self.regions = regions
+
+    def __missing__(self, (cx, cz)):
+        self[cx, cz] = chunk = self.regions[cx // 32, cz // 32].read_chunk(cx, cz)
+        return chunk
+
+def descriptor(key):
+    def get_key(self):
+        return getattr(self.chunk, key)[self.xyz]
+    
+    def set_key(self, value):
+        getattr(self.chunk, key)[self.xyz] = value
+        
+    return property(get_key, set_key)
+
+class Voxel(object):
+    def __init__(self, world, x,y,z):
+        self.chunk = world.chunks[x // 16, z // 16]
+        self.xyz = (x % 16, y, z % 16)
+        
+    def update(self, block=0, data=0):
+        self.block = block
+        self.data = data
+        
+    block = descriptor('blocks')
+    data = descriptor('block_data')
+    skylight = descriptor('skylight')
+    blocklight = descriptor('blocklight')    
+    
 class World(object):
     def __init__(self, name):
         self.name = name
         self.path = os.path.join(os.path.expanduser("~/Library/Application Support/minecraft/saves/"), name)
         self.regions = RegionDict(self.path)
+        self.chunks = ChunkDict(self.regions)
         
-    def read_chunk(self, cx, cz):
-        return self.regions[cx // 32, cz // 32].read_chunk(cx, cz)
+    def __getitem__(self, (x,y,z)):
+        return Voxel(self, x,y,z)
         
-    def write_chunk(self, chunk):
-        self.regions[chunk.cx // 32, chunk.cz // 32].write_chunk(chunk)
-        
-def main():
-    world = World('pytestworld')
-    chunk = world.read_chunk(0,0)
-    
-    composition = collections.defaultdict(lambda: 0)
-    
-    for x,y,z in itertools.product(range(16),range(128),range(16)):
-        if chunk.blocks[x,y,z] in (17,18):
-            chunk.block_data[x,y,z] = 3
-        composition[(chunk.blocks[x,y,z], chunk.block_data[x,y,z])] += 1
-    
-    world.write_chunk(chunk)
-    
-    for key, value in sorted(composition.items(), key=lambda (k,v): -v):
-        print key, value
+    def save(self):
+        for chunk in self.chunks.values():
+            print "Saving chunk", chunk.cx, chunk.cz
+            chunk.relight()
+            self.regions[chunk.cx // 32, chunk.cz // 32].write_chunk(chunk)
 
+def carve_cube(world, (x1,y1,z1), (x2,y2,z2), block):
+    irange = lambda a,b: range(a, b+1, 1 if b >= a else -1)
+    for x,y,z in itertools.product(irange(x1,x2), irange(y1,y2), irange(z1,z2)):
+        if x in (x1,x2) or y in (y1,y2) or z in (z1,z2):
+            world[x,y,z].block = block
+        else:
+            world[x,y,z].block = 0
+            
+
+N, E, W, S = 1,2,4,8
+card_dx = { E: 1, W: -1, N:  0, S: 0 }
+card_dy = { E: 0, W:  0, N: -1, S: 1 }
+card_opposite = { E: W, W:  E, N:  S, S: N }
+
+def shuffled(iter):
+    new_list = list(iter)
+    random.shuffle(new_list)
+    return new_list
+
+def mazegen(w,h):
+    # http://weblog.jamisbuck.org/2010/12/27/maze-generation-recursive-backtracking
+    grid = [[0 for x in range(w)] for y in range(h)]
+    
+    def carve_passages_from(x,y):
+        for direction in shuffled([N,E,W,S]):
+            nx, ny = x + card_dx[direction], y + card_dy[direction]
+            if 0 <= nx < w and 0 <= ny < h and grid[ny][nx] == 0:
+                grid[y][x] |= direction
+                grid[ny][nx] |= card_opposite[direction]
+                carve_passages_from(nx,ny)
+                
+    carve_passages_from(0,0)
+    return grid
+    
+def print_grid(w,h, cell_space, wall_size):
+    grid = mazegen(w,h)
+    
+    grid[0][0] |= N | W
+    grid[h-1][w-1] |= S | E
+    
+    cell_size = cell_space + wall_size*2
+    
+    out_w, out_h = w*cell_size, h*cell_size
+    
+    outgrid = [[True for x in range(out_w)] for y in range(out_h)]
+    
+    for x,y in itertools.product(range(w), range(h)):
+        ox, oy = x*cell_size, y*cell_size
+        
+        exits = grid[y][x]
+        
+        # Carve out cell
+        for cx, cy in itertools.product(range(cell_space), range(cell_space)):
+            outgrid[oy + wall_size + cy][ox + wall_size + cx] = False
+        
+        # Carve out exits
+        if exits & (E | W):
+            for x in range(wall_size):
+                for y in range(cell_space):
+                    if exits & W:
+                        outgrid[oy+wall_size+y][ox+x] = False
+                    if exits & E:
+                        outgrid[oy+wall_size+y][ox+cell_size-wall_size+x] = False
+                    
+        if exits & (N | S):
+            for y in range(wall_size):
+                for x in range(cell_space):
+                    if exits & N:
+                        outgrid[oy+y][ox+wall_size+x] = False
+                    if exits & S:
+                        outgrid[oy+cell_size-wall_size+y][ox+wall_size+x] = False
+    return out_w, out_h, outgrid
+                        
+    import sys
+    out = sys.stdout
+    
+    for y in range(h*cell_size):
+        for x in range(w*cell_size):
+            out.write("#" if outgrid[y][x] else " ")
+        out.write("\n")
+    
+def main():
+    
+    from pprint import pprint
+    
+    w = h = 8
+    gw, gh, grid = print_grid(w=8, h=8, cell_space=6, wall_size=2)
+    print gh, gw
+    
+    world = World('pytestworld')
+    
+    for x,z in itertools.product(range(-64,64), range(-64,64)):
+        world[x, 0, z].block = 7
+        world[x, 1, z].update(48, 1)
+        
+        for y in range(2, 128):
+            world[x, y, z].block = 0
+            
+
+    for x,z in itertools.product(range(gw), range(gh)):
+        if grid[z][x]:
+            for y in range(3):
+                voxel = world[x-40,2+y,z-40]
+                voxel.block = 98
+                voxel.data = 0
+            
+    #carve_cube(world, (-16,6,-16), (16,38,16), 15)
+    
+    world.save()
     
 if __name__ == "__main__":
     main()
