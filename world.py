@@ -39,6 +39,7 @@ class Region(object):
         self.fp.write(data)
     
     def write_chunk(self, chunk):
+        print "Writing chunk (%s, %s) to region (%s, %s)" % (chunk.cx, chunk.cz, self.rx, self.rz)
         self.write_chunk_data(chunk.cx, chunk.cz, chunk.serialize())
         
 class TagType(object):
@@ -178,7 +179,6 @@ class TagOutStream(object):
 
 class Chunk(object):
     def __init__(self, cx, cz, raw_data):
-        print "INIT CHUNK", cx, cz, len(raw_data)
         self.cx, self.cz = cx, cz
         if raw_data:
             length, = struct.unpack(">L", raw_data[:4])
@@ -306,7 +306,6 @@ class World(object):
         
     def save(self):
         for chunk in self.chunks.values():
-            print "Saving chunk", chunk.cx, chunk.cz
             chunk.relight()
             self.regions[chunk.cx // 32, chunk.cz // 32].write_chunk(chunk)
 
@@ -390,6 +389,21 @@ def print_grid(w,h, cell_space, wall_size):
         for x in range(w*cell_size):
             out.write("#" if outgrid[y][x] else " ")
         out.write("\n")
+
+air = 0
+sapling = 6
+wood = 17
+leaves = 18
+tall_grass = 31
+dead_bush = 32
+dandelion = 37
+rose = 38
+brown_mushroom = 39
+red_mushroom = 40
+stone_brick = 98
+cactus = 81
+sugar_cane = 83
+vines = 106
     
 def main():
     
@@ -401,21 +415,29 @@ def main():
     
     world = World('pytestworld')
     
-    for x,z in itertools.product(range(-64,64), range(-64,64)):
-        world[x, 0, z].block = 7
-        world[x, 1, z].update(48, 1)
-        
-        for y in range(2, 128):
-            world[x, y, z].block = 0
-            
-
+    xz_range = list(itertools.product(range(gw), range(gh)))
+    
+    for x,z in xz_range:
+        for y in range(128):
+            voxel = world[x,y,z]
+            if voxel.block in (wood, leaves, tall_grass, dandelion, rose, brown_mushroom, red_mushroom, sapling, dead_bush, cactus, sugar_cane, vines):
+                voxel.update(air)
+    
+    max_y = 0
+    min_y = 128
+    for x,z in xz_range:
+        for y in reversed(range(128)):
+            if world[x,y,z].block:
+                break
+        max_y = max(y, max_y)
+        min_y = min(y, min_y)
+    
     for x,z in itertools.product(range(gw), range(gh)):
+        for y in range(2): world[x, max_y+y, z].update(stone_brick)
         if grid[z][x]:
-            for y in range(3):
-                voxel = world[x-40,2+y,z-40]
-                voxel.block = 98
-                voxel.data = 0
-            
+            for y in range(2,5): world[x, max_y+y, z].update(stone_brick)
+
+
     #carve_cube(world, (-16,6,-16), (16,38,16), 15)
     
     world.save()
