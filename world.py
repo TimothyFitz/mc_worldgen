@@ -5,13 +5,22 @@ import collections
 import zlib
 import itertools
 import random
+import time
+import hashlib
+
 
 from cStringIO import StringIO
+
+sha1 = lambda string: hashlib.sha1(string).hexdigest()
 
 class Region(object):
     def __init__(self, basepath, rx, rz):
         self.rx, self.rz = rx, rz
         self.fp = file(os.path.join(basepath, 'region/r.%s.%s.mcr' % (rx, rz)), 'r+b')
+        self.read_header()
+        
+    def read_header(self):
+        self.fp.seek(0)
         self.header_data = self.fp.read(4096)
 
     def read_chunk_header(self, cx, cz):
@@ -26,21 +35,53 @@ class Region(object):
     def read_chunk_data(self, cx, cz):
         location, size = self.read_chunk_header(cx, cz)
         self.fp.seek(location)
-        return self.fp.read(size)
+        data = self.fp.read(size)
+        print "INIT CHUNK", cx, cz, location, size, sha1(data)
+        return data
+        
+    def write_chunk_header(self, cx, cz, location, size):
+        offset = 4 * ((cx % 32) + (cz % 32) * 32)
+        
+
+        page_location = location >> 12
+        size_in_pages = (size >> 12) + 1
+        
+        assert location % 4096 == 0
+        
+        lb1 = (page_location >> 16) & 0xFF
+        lb2 = (page_location >> 8) & 0xFF
+        lb3 = page_location & 0xFF
+        
+        chunk_header = struct.pack(">BBBB", lb1, lb2, lb3, size_in_pages)
+        
+        self.fp.seek(offset)
+        self.fp.write(chunk_header)
+        
+        self.read_header()
     
     def read_chunk(self, cx, cz):
         return Chunk(cx, cz, self.read_chunk_data(cx,cz))
     
     def write_chunk_data(self, cx, cz, data):
-        prev_location, prev_size = self.read_chunk_header(cx, cz)
+        location, prev_size = self.read_chunk_header(cx, cz)
         if len(data) > prev_size:
-            raise Exception("Unable to write larger data back into chunk. TODO")
-        self.fp.seek(prev_location)
+            print "CHUNK", cx, cz, "LARGER THAN PREVIOUS SIZE, REPLACING"
+            self.fp.seek(0, 2) # Seek to the end of the file
+            location = self.fp.tell()
+            print "Seek to end location", location
+            self.fp.write("\x00" * (4096 - location % 4096)) # Pad file out
+            location = self.fp.tell()
+            print "Real location", location
+            self.write_chunk_header(cx, cz, location, len(data))
+            
+        self.fp.seek(location)
         self.fp.write(data)
+        self.fp.write("\x00" * (4096 - len(data) % 4096))
     
     def write_chunk(self, chunk):
-        print "Writing chunk (%s, %s) to region (%s, %s)" % (chunk.cx, chunk.cz, self.rx, self.rz)
-        self.write_chunk_data(chunk.cx, chunk.cz, chunk.serialize())
+        cx, cz = chunk.cx, chunk.cz
+        data = chunk.serialize()
+        self.write_chunk_data(chunk.cx, chunk.cz, data)
         
 class TagType(object):
     def __init__(self, id):
@@ -211,7 +252,8 @@ class Chunk(object):
         out = TagOutStream()
         out.write_named_tag(self.root_tag)
         data = zlib.compress(out.getvalue(), 9)
-        return struct.pack(">LB", len(data), 2) + data
+        internal_header = struct.pack(">LB", len(data), 2)
+        return internal_header + data
 
 class ChunkHeightMap(object):
     def __init__(self, heightmap_array):
@@ -406,7 +448,7 @@ sugar_cane = 83
 vines = 106
     
 def main():
-    
+    random.seed(101)
     from pprint import pprint
     
     w = h = 8
@@ -432,10 +474,10 @@ def main():
         max_y = max(y, max_y)
         min_y = min(y, min_y)
     
-    for x,z in itertools.product(range(gw), range(gh)):
-        for y in range(2): world[x, max_y+y, z].update(stone_brick)
+    for x,z in xz_range:
+        for y in range(1,3): world[x, max_y-y, z].update(stone_brick, random.randrange(3))
         if grid[z][x]:
-            for y in range(2,5): world[x, max_y+y, z].update(stone_brick)
+            for y in range(3): world[x, max_y+y, z].update(stone_brick, random.randrange(3))
 
 
     #carve_cube(world, (-16,6,-16), (16,38,16), 15)
